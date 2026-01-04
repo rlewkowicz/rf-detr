@@ -46,7 +46,7 @@ class Backbone(BackboneBase):
                  use_cls_token: bool = False,
                  freeze_encoder: bool = False,
                  layer_norm: bool = False,
-                 target_shape: tuple[int, int] = (640, 640),
+                 target_shape: tuple[int, int] = (576, 576),
                  rms_norm: bool = False,
                  backbone_lora: bool = False,
                  gradient_checkpointing: bool = False,
@@ -127,10 +127,12 @@ class Backbone(BackboneBase):
         out = []
         for feat in feats:
             m = tensor_list.mask
-            assert m is not None
-            mask = F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[
-                0
-            ]
+            if m is None:
+                mask = None
+            else:
+                mask = F.interpolate(m[None].float(), size=feat.shape[-2:]).to(torch.bool)[
+                    0
+                ]
             out.append(NestedTensor(feat, mask))
         return out
 

@@ -17,7 +17,6 @@ import argparse
 import copy
 import contextlib
 import datetime
-import json
 import os
 import os.path as osp
 import random
@@ -32,6 +31,7 @@ import pycocotools.mask as mask_util
 
 import numpy as np
 from PIL import Image
+from rfdetr.util.json_utils import load_json
 import torch
 from torch.utils.data import DataLoader, DistributedSampler
 import torchvision.transforms as T
@@ -190,8 +190,7 @@ def convert_to_xywh(boxes):
 
 
 def get_image_list(ann_file):
-    with open(ann_file, 'r') as fin:
-        data = json.load(fin)
+    data = load_json(ann_file)
     return data['images']
 
 
@@ -291,17 +290,41 @@ def box_cxcywh_to_xyxy(x):
     return torch.stack(b, dim=-1)
 
 
-def post_process(outputs, target_sizes):
+def post_process(outputs, target_sizes, num_select=300, max_detections_per_class=20):
     out_logits, out_bbox = outputs['labels'], outputs['dets']
 
     assert len(out_logits) == len(target_sizes)
     assert target_sizes.shape[1] == 2
 
     prob = out_logits.sigmoid()
-    topk_values, topk_indexes = torch.topk(prob.view(out_logits.shape[0], -1), 300, dim=1)
-    scores = topk_values
-    topk_boxes = topk_indexes // out_logits.shape[2]
-    labels = topk_indexes % out_logits.shape[2]
+    num_classes = out_logits.shape[2]
+    if max_detections_per_class is not None and max_detections_per_class > 0:
+        per_class_k = min(max_detections_per_class, prob.shape[1])
+        per_class_scores, per_class_idx = torch.topk(
+            prob.transpose(1, 2),
+            per_class_k,
+            dim=2,
+        )
+        scores = per_class_scores.reshape(prob.shape[0], -1)
+        topk_boxes = per_class_idx.reshape(prob.shape[0], -1)
+        labels = (
+            torch.arange(num_classes, device=prob.device)
+            .view(1, num_classes, 1)
+            .expand(prob.shape[0], num_classes, per_class_k)
+            .reshape(prob.shape[0], -1)
+        )
+        if num_select is not None and num_select > 0 and scores.shape[1] > num_select:
+            topk_values, topk_indexes = torch.topk(scores, num_select, dim=1)
+            scores = topk_values
+            topk_boxes = torch.gather(topk_boxes, 1, topk_indexes)
+            labels = torch.gather(labels, 1, topk_indexes)
+    else:
+        topk_values, topk_indexes = torch.topk(
+            prob.view(out_logits.shape[0], -1), num_select, dim=1
+        )
+        scores = topk_values
+        topk_boxes = topk_indexes // num_classes
+        labels = topk_indexes % num_classes
     boxes = box_cxcywh_to_xyxy(out_bbox)
     boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1,1,4))
     

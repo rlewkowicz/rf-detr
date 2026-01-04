@@ -48,10 +48,14 @@ class PositionEmbeddingSine(nn.Module):
     def forward(self, tensor_list: NestedTensor, align_dim_orders = True):
         x = tensor_list.tensors
         mask = tensor_list.mask
-        assert mask is not None
-        not_mask = ~mask
-        y_embed = not_mask.cumsum(1, dtype=torch.float32)
-        x_embed = not_mask.cumsum(2, dtype=torch.float32)
+        if mask is None:
+            b, _, h, w = x.shape
+            y_embed = torch.arange(1, h + 1, device=x.device, dtype=torch.float32).view(1, h, 1).expand(b, h, w)
+            x_embed = torch.arange(1, w + 1, device=x.device, dtype=torch.float32).view(1, 1, w).expand(b, h, w)
+        else:
+            not_mask = ~mask
+            y_embed = not_mask.cumsum(1, dtype=torch.float32)
+            x_embed = not_mask.cumsum(2, dtype=torch.float32)
         if self.normalize:
             eps = 1e-6
             y_embed = y_embed / (y_embed[:, -1:, :] + eps) * self.scale

@@ -33,10 +33,21 @@ import pycocotools.mask as mask_util
 from rfdetr.util.misc import all_gather
 
 
+def _ensure_coco_metadata(coco_gt):
+    dataset = getattr(coco_gt, "dataset", None)
+    if not isinstance(dataset, dict):
+        coco_gt.dataset = {}
+        dataset = coco_gt.dataset
+    dataset.setdefault("info", {})
+    dataset.setdefault("licenses", [])
+    return coco_gt
+
+
 class CocoEvaluator(object):
     def __init__(self, coco_gt, iou_types):
         assert isinstance(iou_types, (list, tuple))
         coco_gt = copy.deepcopy(coco_gt)
+        coco_gt = _ensure_coco_metadata(coco_gt)
         self.coco_gt = coco_gt
 
         self.iou_types = iou_types

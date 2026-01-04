@@ -89,8 +89,8 @@ def gen_encoder_output_proposals(memory, memory_padding_mask, spatial_shapes, un
             valid_H = torch.sum(~mask_flatten_[:, :, 0, 0], 1)
             valid_W = torch.sum(~mask_flatten_[:, 0, :, 0], 1)
         else:
-            valid_H = torch.tensor([H_ for _ in range(N_)], device=memory.device)
-            valid_W = torch.tensor([W_ for _ in range(N_)], device=memory.device)
+            valid_H = memory.new_full((N_,), H_, dtype=torch.long)
+            valid_W = memory.new_full((N_,), W_, dtype=torch.long)
 
         grid_y, grid_x = torch.meshgrid(torch.linspace(0, H_ - 1, H_, dtype=torch.float32, device=memory.device),
                                         torch.linspace(0, W_ - 1, W_, dtype=torch.float32, device=memory.device))
@@ -219,7 +219,15 @@ class Transformer(nn.Module):
             mask_flatten = torch.cat(mask_flatten, 1)   # bs, \sum{hxw}
             valid_ratios = torch.stack([self.get_valid_ratio(m) for m in masks], 1)
         lvl_pos_embed_flatten = torch.cat(lvl_pos_embed_flatten, 1) # bs, \sum{hxw}, c 
-        spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=memory.device)
+        if memory.is_cuda and torch.cuda.is_current_stream_capturing():
+            # Avoid host->device copies during CUDA graph capture.
+            spatial_shapes_tensor = memory.new_empty((len(spatial_shapes), 2), dtype=torch.long)
+            for idx, (h, w) in enumerate(spatial_shapes):
+                spatial_shapes_tensor[idx, 0] = h
+                spatial_shapes_tensor[idx, 1] = w
+            spatial_shapes = spatial_shapes_tensor
+        else:
+            spatial_shapes = torch.as_tensor(spatial_shapes, dtype=torch.long, device=memory.device)
         level_start_index = torch.cat((spatial_shapes.new_zeros((1, )), spatial_shapes.prod(1).cumsum(0)[:-1]))
         
         if self.two_stage:
@@ -265,6 +273,12 @@ class Transformer(nn.Module):
             boxes_ts = torch.cat(boxes_ts, dim=1)#.transpose(0, 1)
         
         if self.dec_layers > 0:
+            if valid_ratios is None:
+                valid_ratios = torch.ones(
+                    (memory.shape[0], spatial_shapes.shape[0], 2),
+                    device=memory.device,
+                    dtype=memory.dtype,
+                )
             tgt = query_feat.unsqueeze(0).repeat(bs, 1, 1)
             refpoint_embed = refpoint_embed.unsqueeze(0).repeat(bs, 1, 1)
             if self.two_stage:

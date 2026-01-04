@@ -38,35 +38,59 @@ def get_vit_weight_decay_rate(name, weight_decay_rate=1.0):
     return weight_decay_rate
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    """Unwrap common wrappers (e.g., torch.compile) to keep parameter names stable."""
+    unwrapped = model
+    while True:
+        if hasattr(unwrapped, "_orig_mod") and isinstance(unwrapped._orig_mod, nn.Module):
+            if unwrapped._orig_mod is unwrapped:
+                break
+            unwrapped = unwrapped._orig_mod
+            continue
+        if hasattr(unwrapped, "module") and isinstance(unwrapped.module, nn.Module):
+            if unwrapped.module is unwrapped:
+                break
+            unwrapped = unwrapped.module
+            continue
+        break
+    return unwrapped
+
+
 def get_param_dict(args, model_without_ddp: nn.Module):
-    assert isinstance(model_without_ddp.backbone, Joiner)
-    backbone = model_without_ddp.backbone[0]
+
+
+    model = _unwrap_model(model_without_ddp)
+
+    assert isinstance(model.backbone, Joiner)
+
+    backbone = model.backbone[0]
     backbone_named_param_lr_pairs = backbone.get_named_param_lr_pairs(args, prefix="backbone.0")
     backbone_param_lr_pairs = [param_dict for _, param_dict in backbone_named_param_lr_pairs.items()]
+    backbone_param_ids = {id(param_dict["params"]) for param_dict in backbone_param_lr_pairs}
 
-    decoder_key = 'transformer.decoder'
-    decoder_params = [
-        p
-        for n, p in model_without_ddp.named_parameters() if decoder_key in n and p.requires_grad
-    ]
+    decoder_key = "transformer.decoder"
+    segmentation_key = "segmentation_head"
 
-    decoder_param_lr_pairs = [
-        {"params": param, "lr": args.lr * args.lr_component_decay} 
-        for param in decoder_params
-    ]
+    decoder_param_lr_pairs = []
+    segmentation_param_lr_pairs = []
+    other_param_dicts = []
 
-    other_params = [
-        p
-        for n, p in model_without_ddp.named_parameters() if (
-            n not in backbone_named_param_lr_pairs and decoder_key not in n and p.requires_grad)
-    ]
-    other_param_dicts = [
-        {"params": param, "lr": args.lr} 
-        for param in other_params
-    ]
-    
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+        if id(param) in backbone_param_ids:
+            continue
+        if decoder_key in name:
+            decoder_param_lr_pairs.append(
+                {"params": param, "lr": args.lr * args.lr_component_decay}
+            )
+        elif segmentation_key in name:
+            segmentation_param_lr_pairs.append({"params": param, "lr": args.lr})
+        else:
+            other_param_dicts.append({"params": param, "lr": args.lr})
+
     final_param_dicts = (
-        other_param_dicts + backbone_param_lr_pairs + decoder_param_lr_pairs
+        other_param_dicts + backbone_param_lr_pairs + decoder_param_lr_pairs + segmentation_param_lr_pairs
     )
 
     return final_param_dicts

@@ -18,6 +18,8 @@ import torch
 import torch.nn.functional as F
 from torchvision.ops.boxes import box_area
 
+EPS = 1e-6
+
 
 def box_cxcywh_to_xyxy(x):
     x_c, y_c, w, h = x.unbind(-1)
@@ -46,7 +48,23 @@ def box_iou(boxes1, boxes2):
 
     union = area1[:, None] + area2 - inter
 
-    iou = inter / union
+    iou = inter / (union + EPS)
+    return iou, union
+
+
+def box_iou_pairwise(boxes1, boxes2):
+    """IoU for aligned pairs of boxes in [x0, y0, x1, y1] format."""
+    area1 = box_area(boxes1)
+    area2 = box_area(boxes2)
+
+    lt = torch.max(boxes1[:, :2], boxes2[:, :2])  # [N,2]
+    rb = torch.min(boxes1[:, 2:], boxes2[:, 2:])  # [N,2]
+
+    wh = (rb - lt).clamp(min=0)  # [N,2]
+    inter = wh[:, 0] * wh[:, 1]  # [N]
+
+    union = area1 + area2 - inter
+    iou = inter / (union + EPS)
     return iou, union
 
 
@@ -69,7 +87,20 @@ def generalized_box_iou(boxes1, boxes2):
     wh = (rb - lt).clamp(min=0)  # [N,M,2]
     area = wh[:, :, 0] * wh[:, :, 1]
 
-    return iou - (area - union) / area
+    return iou - (area - union) / (area + EPS)
+
+
+def generalized_box_iou_pairwise(boxes1, boxes2):
+    """GIoU for aligned pairs of boxes in [x0, y0, x1, y1] format."""
+    iou, union = box_iou_pairwise(boxes1, boxes2)
+
+    lt = torch.min(boxes1[:, :2], boxes2[:, :2])  # [N,2]
+    rb = torch.max(boxes1[:, 2:], boxes2[:, 2:])  # [N,2]
+
+    wh = (rb - lt).clamp(min=0)  # [N,2]
+    area = wh[:, 0] * wh[:, 1]  # [N]
+
+    return iou - (area - union) / (area + EPS)
 
 
 def masks_to_boxes(masks):

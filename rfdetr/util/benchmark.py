@@ -11,7 +11,6 @@
 # ------------------------------------------------------------------------
 
 from collections import OrderedDict, Counter, defaultdict
-import json
 import os
 import pdb
 from posixpath import join
@@ -34,6 +33,7 @@ import time
 
 from typing import Any, Callable, List, Optional, Union
 from numbers import Number
+from rfdetr.util.json_utils import dumps_json
 
 Handle = Callable[[List[Any], List[Any]], Union[typing.Counter[str], Number]]
 
@@ -624,11 +624,11 @@ def benchmark(model, dataset, output_dir):
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
     with (output_dir / "log.txt").open("a") as f:
         f.write("Test benchmark on Val Dataset" + "\n")
-        f.write(json.dumps(_outputs, indent=2) + "\n")
+        f.write(dumps_json(_outputs, indent=True) + "\n")
 
     return _outputs
 
 
 # if __name__ == "__main__":
 #     res = benchmark()
-#     print(json.dumps(res, indent=2))
+#     print(dumps_json(res, indent=True))

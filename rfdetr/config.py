@@ -37,6 +37,7 @@ class ModelConfig(BaseModel):
     cls_loss_coef: float = 1.0
     segmentation_head: bool = False
     mask_downsample_ratio: int = 4
+    max_detections_per_class: int = 20
 
 
 class RFDETRBaseConfig(ModelConfig):
@@ -53,6 +54,7 @@ class RFDETRBaseConfig(ModelConfig):
     dec_n_points: int = 2
     num_queries: int = 300
     num_select: int = 300
+    max_detections_per_class: int = 20
     projector_scale: List[Literal["P3", "P4", "P5"]] = ["P4"]
     out_feature_indexes: List[int] = [2, 5, 8, 11]
     pretrain_weights: Optional[str] = "rf-detr-base.pth"
@@ -138,9 +140,11 @@ class TrainConfig(BaseModel):
     ia_bce_loss: bool = True
     cls_loss_coef: float = 1.0
     num_select: int = 300
+    max_detections_per_class: int = 20
     dataset_file: Literal["coco", "o365", "roboflow"] = "roboflow"
     square_resize_div_64: bool = True
     dataset_dir: str
+    share_labels: bool = True
     output_dir: str = "output"
     multi_scale: bool = True
     expanded_scales: bool = True
@@ -158,6 +162,7 @@ class TrainConfig(BaseModel):
     run: Optional[str] = None
     class_names: List[str] = None
     run_test: bool = True
+    eval_ema: bool = True
     segmentation_head: bool = False
 
 

@@ -20,7 +20,7 @@ import argparse
 import ast
 import copy
 import datetime
-import json
+import inspect
 import math
 import os
 import random
@@ -31,8 +31,19 @@ from logging import getLogger
 from pathlib import Path
 from typing import DefaultDict, List, Callable
 
+try:
+    import cv2
+    cv2.setNumThreads(0)
+except ImportError:
+    pass
+
 import numpy as np
 import torch
+# Optimize for 3090 Ti
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
+torch.backends.cudnn.benchmark = True
+
 from peft import LoraConfig, get_peft_model
 from torch.utils.data import DataLoader, DistributedSampler
 
@@ -44,6 +55,7 @@ from rfdetr.util.benchmark import benchmark
 from rfdetr.util.drop_scheduler import drop_scheduler
 from rfdetr.util.files import download_file
 from rfdetr.util.get_param_dicts import get_param_dict
+from rfdetr.util.json_utils import dump_json, dumps_json, load_json
 from rfdetr.util.utils import ModelEma, BestMetricHolder, clean_state_dict
 
 if str(os.environ.get("USE_FILE_SYSTEM_SHARING", "False")).lower() in ["true", "1"]:
@@ -51,6 +63,20 @@ if str(os.environ.get("USE_FILE_SYSTEM_SHARING", "False")).lower() in ["true", "
     torch.multiprocessing.set_sharing_strategy('file_system')
 
 logger = getLogger(__name__)
+
+DEFAULT_BATCH_SIZE = 3
+DEFAULT_GRAD_ACCUM_STEPS = 42
+
+def _get_default_workers():
+    if hasattr(os, "sched_getaffinity"):
+        try:
+            return max(0, len(os.sched_getaffinity(0)) - 2)
+        except NotImplementedError:
+            pass
+    return max(0, (os.cpu_count() or 0) - 2)
+
+
+DEFAULT_NUM_WORKERS = _get_default_workers()
 
 HOSTED_MODELS = {
     "rf-detr-base.pth": "https://storage.googleapis.com/rfdetr/rf-detr-base-coco.pth",
@@ -63,6 +89,28 @@ HOSTED_MODELS = {
     "rf-detr-medium.pth": "https://storage.googleapis.com/rfdetr/medium_coco/checkpoint_best_regular.pth",
     "rf-detr-seg-preview.pt": "https://storage.googleapis.com/rfdetr/rf-detr-seg-preview.pt",
 }
+
+def _resolve_inductor_cudagraphs(args, fallback=None):
+    use_cudagraphs = getattr(args, "inductor_cudagraphs", None)
+    if use_cudagraphs is None:
+        use_cudagraphs = fallback
+    if use_cudagraphs is None:
+        use_cudagraphs = not getattr(args, "cuda_graph", False)
+    return bool(use_cudagraphs)
+
+
+def configure_inductor(args, fallback=None):
+    use_cudagraphs = _resolve_inductor_cudagraphs(args, fallback=fallback)
+    args.inductor_cudagraphs = use_cudagraphs
+    if hasattr(torch, "_inductor") and hasattr(torch._inductor, "config"):
+        triton_config = getattr(torch._inductor.config, "triton", None)
+        if triton_config is not None and hasattr(triton_config, "cudagraphs"):
+            triton_config.cudagraphs = use_cudagraphs
+    if getattr(args, "cuda_graph", False) and use_cudagraphs:
+        print(
+            "Warning: both manual CUDA Graph capture and Inductor cudagraphs are enabled; "
+            "disable one if you hit instability."
+        )
 
 def download_pretrain_weights(pretrain_weights: str, redownload=False):
     if pretrain_weights in HOSTED_MODELS:
@@ -82,6 +130,11 @@ class Model:
         self.resolution = args.resolution
         self.model = build_model(args)
         self.device = torch.device(args.device)
+        if args.pretrain_weights is not None and args.patch_size != 14:
+            print(
+                "warning: patch_size != 14; pretrained weights may not match "
+                "the current backbone configuration."
+            )
         if args.pretrain_weights is not None:
             print("Loading pretrain weights")
             try:
@@ -113,7 +166,7 @@ class Model:
                 for modify_key_to_load in args.pretrain_keys_modify_to_load:
                     try:
                         checkpoint['model'][modify_key_to_load] = get_coco_pretrain_from_obj365(
-                            model_without_ddp.state_dict()[modify_key_to_load],
+                            self.model.state_dict()[modify_key_to_load],
                             checkpoint['model'][modify_key_to_load]
                         )
                     except:
@@ -142,8 +195,17 @@ class Model:
                 ]
             )
             self.model.backbone[0].encoder = get_peft_model(self.model.backbone[0].encoder, lora_config)
-        self.model = self.model.to(self.device)
-        self.postprocess = PostProcess(num_select=args.num_select)
+        self.model = self.model.to(self.device, memory_format=torch.channels_last)
+        configure_inductor(self.args)
+        try:
+            print("Compiling model...")
+            self.model = torch.compile(self.model)
+        except Exception as e:
+            print(f"Could not compile model: {e}")
+        self.postprocess = PostProcess(
+            num_select=args.num_select,
+            max_detections_per_class=args.max_detections_per_class,
+        )
         self.stop_early = False
     
     def reinitialize_detection_head(self, num_classes):
@@ -162,11 +224,30 @@ class Model:
                     f"Currently supported callbacks: {currently_supported_callbacks}"
                 )
         args = populate_args(**kwargs)
+        if not hasattr(args, "patch_size"):
+            args.patch_size = getattr(self.args, "patch_size", 16)
+        if not hasattr(args, "num_windows"):
+            args.num_windows = getattr(self.args, "num_windows", 4)
+        configure_inductor(args, fallback=getattr(self.args, "inductor_cudagraphs", None))
+        run_test = getattr(args, "run_test", True)
+        if hasattr(args, "test"):
+            run_test = args.test
+        eval_with_ema = bool(getattr(args, "use_ema", False))
+        args.run_test = run_test
+        args.eval_ema = eval_with_ema
+
         if getattr(args, 'class_names') is not None:
             self.args.class_names = args.class_names
             self.args.num_classes = args.num_classes
 
         utils.init_distributed_mode(args)
+        total_workers = _get_default_workers()
+        if args.distributed:
+            per_rank = max(1, total_workers // utils.get_world_size())
+            args.num_workers = per_rank
+        else:
+            args.num_workers = total_workers
+        print(f"Using {args.num_workers} workers")
         print("git:\n  {}\n".format(utils.get_sha()))
         print(args)
         device = torch.device(args.device)
@@ -194,19 +275,131 @@ class Model:
 
         param_dicts = [p for p in param_dicts if p['params'].requires_grad]
 
-        optimizer = torch.optim.AdamW(param_dicts, lr=args.lr, 
-                                    weight_decay=args.weight_decay)
+        adamw_kwargs = {
+            "lr": args.lr,
+            "weight_decay": args.weight_decay,
+        }
+        use_fused_adamw = False
+        if device.type == "cuda":
+            try:
+                if "fused" in inspect.signature(torch.optim.AdamW).parameters:
+                    adamw_kwargs["fused"] = True
+                    use_fused_adamw = True
+            except (TypeError, ValueError):
+                pass
+        optimizer = torch.optim.AdamW(param_dicts, **adamw_kwargs)
+        if use_fused_adamw and utils.is_main_process():
+            print("Using fused AdamW optimizer")
         # Choose the learning rate scheduler based on the new argument
 
         dataset_train = build_dataset(image_set='train', args=args, resolution=args.resolution)
         dataset_val = build_dataset(image_set='val', args=args, resolution=args.resolution)
-        dataset_test = build_dataset(image_set='test' if args.dataset_file == "roboflow" else "val", args=args, resolution=args.resolution)
+        dataset_test = None
+        if run_test:
+            test_split = "test" if args.dataset_file == "roboflow" else "val"
+            dataset_test = build_dataset(image_set=test_split, args=args, resolution=args.resolution)
 
-        # for cosine annealing, calculate total training steps and warmup steps
-        total_batch_size_for_lr = args.batch_size * utils.get_world_size() * args.grad_accum_steps
-        num_training_steps_per_epoch_lr = (len(dataset_train) + total_batch_size_for_lr - 1) // total_batch_size_for_lr
+        if getattr(args, "cache_images", False):
+            cache_batch_size = max(1, args.batch_size)
+
+            def _warm_cache(dataset, name):
+                if hasattr(dataset, "ensure_cache"):
+                    cache_dir = getattr(dataset, "cache_dir", None)
+                    location = f" ({cache_dir})" if cache_dir else ""
+                    print(f"Caching {name} images{location}...")
+                    dataset.ensure_cache(
+                        workers=args.num_workers,
+                        batch_size=cache_batch_size,
+                    )
+
+            if utils.is_main_process():
+                _warm_cache(dataset_train, "train")
+                _warm_cache(dataset_val, "val")
+                if dataset_test is not None and args.dataset_file == "roboflow":
+                    _warm_cache(dataset_test, "test")
+            if utils.is_dist_avail_and_initialized():
+                torch.distributed.barrier()
+
+        if getattr(args, "preload_shared", False):
+            preload_workers = max(1, args.num_workers)
+
+            def _preload_shared(dataset, name):
+                if hasattr(dataset, "preload_shared"):
+                    if utils.is_main_process():
+                        print(f"Preloading {name} into shared RAM...")
+                    dataset.preload_shared(workers=preload_workers)
+
+            _preload_shared(dataset_train, "train")
+            _preload_shared(dataset_val, "val")
+            if dataset_test is not None and args.dataset_file == "roboflow":
+                _preload_shared(dataset_test, "test")
+
+        if args.distributed:
+            sampler_train = DistributedSampler(dataset_train)
+            sampler_val = DistributedSampler(dataset_val, shuffle=False)
+            sampler_test = DistributedSampler(dataset_test, shuffle=False) if dataset_test is not None else None
+        else:
+            sampler_train = torch.utils.data.RandomSampler(dataset_train)
+            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
+            sampler_test = torch.utils.data.SequentialSampler(dataset_test) if dataset_test is not None else None
+
+        effective_batch_size = args.batch_size * args.grad_accum_steps
+        prefetch_factor = (
+            max(1, 6 // max(1, args.batch_size)) if args.num_workers > 0 else None
+        )
+        min_batches = kwargs.get('min_batches', 5)
+        if len(dataset_train) < effective_batch_size * min_batches:
+            logger.info(
+                f"Training with uniform sampler because dataset is too small: {len(dataset_train)} < {effective_batch_size * min_batches}"
+            )
+            sampler = torch.utils.data.RandomSampler(
+                dataset_train,
+                replacement=True,
+                num_samples=args.batch_size * args.grad_accum_steps * min_batches,
+            )
+            data_loader_train = DataLoader(
+                dataset_train,
+                batch_size=args.batch_size,
+                collate_fn=utils.collate_fn,
+                num_workers=args.num_workers,
+                sampler=sampler,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=True if args.num_workers > 0 else False,
+                pin_memory=True,
+            )
+        else:
+            batch_sampler_train = torch.utils.data.BatchSampler(
+                sampler_train, args.batch_size, drop_last=True)
+            data_loader_train = DataLoader(
+                dataset_train, 
+                batch_sampler=batch_sampler_train,
+                collate_fn=utils.collate_fn, 
+                num_workers=args.num_workers,
+                prefetch_factor=prefetch_factor,
+                persistent_workers=True if args.num_workers > 0 else False,
+                pin_memory=True,
+            )
+        
+        data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
+                                    drop_last=False, collate_fn=utils.collate_fn, 
+                                    num_workers=args.num_workers,
+                                    prefetch_factor=prefetch_factor,
+                                    persistent_workers=True if args.num_workers > 0 else False,
+                                    pin_memory=True)
+        data_loader_test = None
+        if dataset_test is not None:
+            data_loader_test = DataLoader(dataset_test, args.batch_size, sampler=sampler_test,
+                                        drop_last=False, collate_fn=utils.collate_fn, 
+                                        num_workers=args.num_workers,
+                                        prefetch_factor=prefetch_factor,
+                                        persistent_workers=True if args.num_workers > 0 else False,
+                                        pin_memory=True)
+
+        num_training_steps_per_epoch_lr = max(
+            1, len(data_loader_train) // max(1, args.grad_accum_steps)
+        )
         total_training_steps_lr = num_training_steps_per_epoch_lr * args.epochs
-        warmup_steps_lr = num_training_steps_per_epoch_lr * args.warmup_epochs
+        warmup_steps_lr = int(num_training_steps_per_epoch_lr * args.warmup_epochs)
         def lr_lambda(current_step: int):
             if current_step < warmup_steps_lr:
                 # Linear warmup
@@ -223,52 +416,8 @@ class Model:
                         return 0.1
         lr_scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=lr_lambda)
 
-        if args.distributed:
-            sampler_train = DistributedSampler(dataset_train)
-            sampler_val = DistributedSampler(dataset_val, shuffle=False)
-            sampler_test = DistributedSampler(dataset_test, shuffle=False)
-        else:
-            sampler_train = torch.utils.data.RandomSampler(dataset_train)
-            sampler_val = torch.utils.data.SequentialSampler(dataset_val)
-            sampler_test = torch.utils.data.SequentialSampler(dataset_test)
-
-        effective_batch_size = args.batch_size * args.grad_accum_steps
-        min_batches = kwargs.get('min_batches', 5)
-        if len(dataset_train) < effective_batch_size * min_batches:
-            logger.info(
-                f"Training with uniform sampler because dataset is too small: {len(dataset_train)} < {effective_batch_size * min_batches}"
-            )
-            sampler = torch.utils.data.RandomSampler(
-                dataset_train,
-                replacement=True,
-                num_samples=effective_batch_size * min_batches,
-            )
-            data_loader_train = DataLoader(
-                dataset_train,
-                batch_size=effective_batch_size,
-                collate_fn=utils.collate_fn,
-                num_workers=args.num_workers,
-                sampler=sampler,
-            )
-        else:
-            batch_sampler_train = torch.utils.data.BatchSampler(
-                sampler_train, effective_batch_size, drop_last=True)
-            data_loader_train = DataLoader(
-                dataset_train, 
-                batch_sampler=batch_sampler_train,
-                collate_fn=utils.collate_fn, 
-                num_workers=args.num_workers
-            )
-        
-        data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
-                                    drop_last=False, collate_fn=utils.collate_fn, 
-                                    num_workers=args.num_workers)
-        data_loader_test = DataLoader(dataset_test, args.batch_size, sampler=sampler_test,
-                                    drop_last=False, collate_fn=utils.collate_fn, 
-                                    num_workers=args.num_workers)
-
         base_ds = get_coco_api_from_dataset(dataset_val)
-        base_ds_test = get_coco_api_from_dataset(dataset_test)
+        base_ds_test = get_coco_api_from_dataset(dataset_test) if dataset_test is not None else None
         if args.use_ema:
             self.ema_m = ModelEma(model_without_ddp, decay=args.ema_decay, tau=args.ema_tau)
         else:
@@ -282,7 +431,7 @@ class Model:
             if args.do_benchmark:
                 benchmark_model = copy.deepcopy(model_without_ddp)
                 bm = benchmark(benchmark_model.float(), dataset_val, output_dir)
-                print(json.dumps(bm, indent=2))
+                print(dumps_json(bm, indent=True))
                 del benchmark_model
         
         if args.resume:
@@ -300,8 +449,9 @@ class Model:
                 args.start_epoch = checkpoint['epoch'] + 1
 
         if args.eval:
+            eval_model = self.ema_m.module if eval_with_ema else model
             test_stats, coco_evaluator = evaluate(
-                model, criterion, postprocess, data_loader_val, base_ds, device, args)
+                eval_model, criterion, postprocess, data_loader_val, base_ds, device, args)
             if args.output_dir:
                 if not args.segmentation_head:
                     utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, output_dir / "eval.pth")
@@ -311,7 +461,9 @@ class Model:
         
         # for drop
         total_batch_size = effective_batch_size * utils.get_world_size()
-        num_training_steps_per_epoch = (len(dataset_train) + total_batch_size - 1) // total_batch_size
+        num_training_steps_per_epoch = max(
+            1, len(data_loader_train) // max(1, args.grad_accum_steps)
+        )
         schedules = {}
         if args.dropout > 0:
             schedules['do'] = drop_scheduler(
@@ -340,7 +492,7 @@ class Model:
             criterion.train()
             train_stats = train_one_epoch(
                 model, criterion, lr_scheduler, data_loader_train, optimizer, device, epoch,
-                effective_batch_size, args.clip_max_norm, ema_m=self.ema_m, schedules=schedules, 
+                args.batch_size, args.clip_max_norm, ema_m=self.ema_m, schedules=schedules, 
                 num_training_steps_per_epoch=num_training_steps_per_epoch,
                 vit_encoder_num_layers=args.vit_encoder_num_layers, args=args, callbacks=callbacks)
             train_epoch_time = time.time() - epoch_start_time
@@ -369,51 +521,23 @@ class Model:
                         utils.save_on_master(weights, checkpoint_path)
 
             with torch.inference_mode():
+                eval_model = self.ema_m.module if eval_with_ema else model
                 test_stats, coco_evaluator = evaluate(
-                    model, criterion, postprocess, data_loader_val, base_ds, device, args=args
+                    eval_model, criterion, postprocess, data_loader_val, base_ds, device, args=args
                 )
             if not args.segmentation_head:
-                map_regular = test_stats["coco_eval_bbox"][0]
+                map_eval = test_stats["coco_eval_bbox"][0]
             else:
-                map_regular = test_stats["coco_eval_masks"][0]
-            _isbest = best_map_holder.update(map_regular, epoch, is_ema=False)
+                map_eval = test_stats["coco_eval_masks"][0]
+            _isbest = best_map_holder.update(map_eval, epoch, is_ema=eval_with_ema)
             if _isbest:
-                best_map_5095 = max(best_map_5095, map_regular)
                 if not args.segmentation_head:
                     map50 = test_stats["coco_eval_bbox"][1]
                 else:
                     map50 = test_stats["coco_eval_masks"][1]
-                best_map_50 = max(best_map_50, map50)
-                checkpoint_path = output_dir / 'checkpoint_best_regular.pth'
-                if not args.dont_save_weights:
-                    utils.save_on_master({
-                        'model': model_without_ddp.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'lr_scheduler': lr_scheduler.state_dict(),
-                        'epoch': epoch,
-                        'args': args,
-                    }, checkpoint_path)
-            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                        **{f'test_{k}': v for k, v in test_stats.items()},
-                        'epoch': epoch,
-                        'n_parameters': n_parameters}
-            if args.use_ema:
-                ema_test_stats, _ = evaluate(
-                    self.ema_m.module, criterion, postprocess, data_loader_val, base_ds, device, args=args
-                )
-                log_stats.update({f'ema_test_{k}': v for k,v in ema_test_stats.items()})
-                if not args.segmentation_head:
-                    map_ema = ema_test_stats["coco_eval_bbox"][0]
-                else:
-                    map_ema = ema_test_stats["coco_eval_masks"][0]
-                best_map_ema_5095 = max(best_map_ema_5095, map_ema)
-                _isbest = best_map_holder.update(map_ema, epoch, is_ema=True)
-                if _isbest:
-                    if not args.segmentation_head:
-                        map_ema_50 = ema_test_stats["coco_eval_bbox"][1]
-                    else:
-                        map_ema_50 = ema_test_stats["coco_eval_masks"][1]
-                    best_map_ema_50 = max(best_map_ema_50, map_ema_50)
+                if eval_with_ema:
+                    best_map_ema_5095 = max(best_map_ema_5095, map_eval)
+                    best_map_ema_50 = max(best_map_ema_50, map50)
                     checkpoint_path = output_dir / 'checkpoint_best_ema.pth'
                     if not args.dont_save_weights:
                         utils.save_on_master({
@@ -423,6 +547,24 @@ class Model:
                             'epoch': epoch,
                             'args': args,
                         }, checkpoint_path)
+                else:
+                    best_map_5095 = max(best_map_5095, map_eval)
+                    best_map_50 = max(best_map_50, map50)
+                    checkpoint_path = output_dir / 'checkpoint_best_regular.pth'
+                    if not args.dont_save_weights:
+                        utils.save_on_master({
+                            'model': model_without_ddp.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'lr_scheduler': lr_scheduler.state_dict(),
+                            'epoch': epoch,
+                            'args': args,
+                        }, checkpoint_path)
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                        **{f'test_{k}': v for k, v in test_stats.items()},
+                        'epoch': epoch,
+                        'n_parameters': n_parameters}
+            if eval_with_ema:
+                log_stats.update({f'ema_test_{k}': v for k,v in test_stats.items()})
             log_stats.update(best_map_holder.summary())
             
             # epoch parameters
@@ -441,7 +583,7 @@ class Model:
             log_stats['epoch_time'] = epoch_time_str
             if args.output_dir and utils.is_main_process():
                 with (output_dir / "log.txt").open("a") as f:
-                    f.write(json.dumps(log_stats) + "\n")
+                    f.write(dumps_json(log_stats) + "\n")
 
                 # for evaluation logs
                 if coco_evaluator is not None:
@@ -466,26 +608,29 @@ class Model:
                 print(f"Early stopping requested, stopping at epoch {epoch}")
                 break
 
-        best_is_ema = best_map_ema_5095 > best_map_5095
+        best_is_ema = eval_with_ema
         
         if utils.is_main_process():
-            if best_is_ema:
-                shutil.copy2(output_dir / 'checkpoint_best_ema.pth', output_dir / 'checkpoint_best_total.pth')
-            else:
-                shutil.copy2(output_dir / 'checkpoint_best_regular.pth', output_dir / 'checkpoint_best_total.pth')
-            
-            utils.strip_checkpoint(output_dir / 'checkpoint_best_total.pth')
+            if not args.dont_save_weights:
+                best_total_path = output_dir / 'checkpoint_best_total.pth'
+                candidates = []
+                if best_is_ema:
+                    candidates.append(output_dir / 'checkpoint_best_ema.pth')
+                else:
+                    candidates.append(output_dir / 'checkpoint_best_regular.pth')
+                candidates.append(output_dir / 'checkpoint.pth')
+                source_path = next((p for p in candidates if p.exists()), None)
+                if source_path is not None:
+                    shutil.copy2(source_path, best_total_path)
+                    utils.strip_checkpoint(best_total_path)
+                else:
+                    print("Warning: No checkpoint file found to create checkpoint_best_total.pth")
         
-            best_map_5095 = max(best_map_5095, best_map_ema_5095)
-            if best_is_ema:
-                results = ema_test_stats["results_json"]
-            else:
-                results = test_stats["results_json"]
+            results = test_stats["results_json"]
 
             class_map = results["class_map"]
             results["class_map"] = {"valid": class_map}
-            with open(output_dir / "results.json", "w") as f:
-                json.dump(results, f)
+            dump_json(output_dir / "results.json", results)
 
             total_time = time.time() - start_time
             total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -497,7 +642,7 @@ class Model:
             self.model = self.ema_m.module
         self.model.eval()
 
-        if args.run_test:
+        if run_test:
             best_state_dict = torch.load(output_dir / 'checkpoint_best_total.pth', map_location='cpu', weights_only=False)['model']
             model.load_state_dict(best_state_dict)
             model.eval()
@@ -506,12 +651,10 @@ class Model:
                 model, criterion, postprocess, data_loader_test, base_ds_test, device, args=args
             )
             print(f"Test results: {test_stats}")
-            with open(output_dir / "results.json", "r") as f:
-                results = json.load(f)
+            results = load_json(output_dir / "results.json")
             test_metrics = test_stats["results_json"]["class_map"]
             results["class_map"]["test"] = test_metrics
-            with open(output_dir / "results.json", "w") as f:
-                json.dump(results, f)
+            dump_json(output_dir / "results.json", results)
 
         for callback in callbacks["on_train_end"]:
             callback()
@@ -657,11 +800,14 @@ if __name__ == '__main__':
             "dist_url",
             "sync_bn",
             "fp16_eval",
+            "cuda_graph",
+            "inductor_cudagraphs",
             "infer_dir",
             "verbose",
             "opset_version",
             "dry_run",
             "shape",
+            "max_detections_per_class",
         ]
         for key in filter_keys:
             config.pop(key, None)  # Use pop with None to avoid KeyError
@@ -676,11 +822,11 @@ if __name__ == '__main__':
 def get_args_parser():
     parser = argparse.ArgumentParser('Set transformer detector', add_help=False)
     parser.add_argument('--num_classes', default=2, type=int)
-    parser.add_argument('--grad_accum_steps', default=1, type=int)
+    parser.add_argument('--grad_accum_steps', default=DEFAULT_GRAD_ACCUM_STEPS, type=int)
     parser.add_argument('--amp', default=False, type=bool)
     parser.add_argument('--lr', default=1e-4, type=float)
     parser.add_argument('--lr_encoder', default=1.5e-4, type=float)
-    parser.add_argument('--batch_size', default=2, type=int)
+    parser.add_argument('--batch_size', default=DEFAULT_BATCH_SIZE, type=int)
     parser.add_argument('--weight_decay', default=1e-4, type=float)
     parser.add_argument('--epochs', default=12, type=int)
     parser.add_argument('--lr_drop', default=11, type=int)
@@ -752,10 +898,17 @@ def get_args_parser():
     parser.add_argument('--lite_refpoint_refine', action='store_true', help='lite refpoint refine mode for speed-up')
     parser.add_argument('--num_select', default=100, type=int,
                         help='the number of predictions selected for evaluation')
+    parser.add_argument(
+        '--max_detections_per_class',
+        default=20,
+        type=int,
+        help='max detections per class, per image (0 disables the cap)',
+    )
     parser.add_argument('--dec_n_points', default=4, type=int,
                         help='the number of sampling points')
     parser.add_argument('--decoder_norm', default='LN', type=str)
     parser.add_argument('--bbox_reparam', action='store_true')
+    parser.add_argument('--segmentation_head', action='store_true')
     parser.add_argument('--freeze_batch_norm', action='store_true')
     # * Matcher
     parser.add_argument('--set_cost_class', default=2, type=float,
@@ -769,6 +922,10 @@ def get_args_parser():
     parser.add_argument('--cls_loss_coef', default=2, type=float)
     parser.add_argument('--bbox_loss_coef', default=5, type=float)
     parser.add_argument('--giou_loss_coef', default=2, type=float)
+    parser.add_argument('--mask_ce_loss_coef', default=1.0, type=float)
+    parser.add_argument('--mask_dice_loss_coef', default=1.0, type=float)
+    parser.add_argument('--mask_point_sample_ratio', default=16, type=int)
+    parser.add_argument('--mask_downsample_ratio', default=4, type=int)
     parser.add_argument('--focal_alpha', default=0.25, type=float)
     
     # Loss
@@ -785,6 +942,21 @@ def get_args_parser():
     parser.add_argument('--coco_path', type=str)
     parser.add_argument('--dataset_dir', type=str)
     parser.add_argument('--square_resize_div_64', action='store_true')
+    parser.add_argument('--cache_images', dest='cache_images', action='store_true',
+                        help='cache images as normalized numpy arrays on disk')
+    parser.add_argument('--no-cache_images', dest='cache_images', action='store_false',
+                        help='disable image caching')
+    parser.set_defaults(cache_images=True)
+    parser.add_argument('--cache_dir', type=str, default=None,
+                        help='cache directory (default: <dataset_root>/cache)')
+    parser.add_argument('--preload_shared', action='store_true',
+                        help='preload images/targets into shared RAM for dataloader workers')
+    parser.add_argument(
+        '--share_labels',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='share label data across ranks via shared memory when distributed',
+    )
 
     parser.add_argument('--output_dir', default='output',
                         help='path where to save, empty for no saving')
@@ -800,7 +972,7 @@ def get_args_parser():
     parser.add_argument('--ema_decay', default=0.9997, type=float)
     parser.add_argument('--ema_tau', default=0, type=float)
 
-    parser.add_argument('--num_workers', default=2, type=int)
+    parser.add_argument('--num_workers', default=DEFAULT_NUM_WORKERS, type=int)
 
     # distributed training parameters
     parser.add_argument('--device', default='cuda',
@@ -815,11 +987,26 @@ def get_args_parser():
     # fp16
     parser.add_argument('--fp16_eval', default=False, action='store_true',
                         help='evaluate in fp16 precision.')
+    parser.add_argument(
+        '--cuda_graph',
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help='Enable CUDA Graph capture for the model forward pass.',
+    )
+    parser.add_argument(
+        '--inductor_cudagraphs',
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            'Enable TorchInductor CUDA graphs for torch.compile (default: auto; '
+            'disabled when --cuda_graph is on).'
+        ),
+    )
 
     # custom args
     parser.add_argument('--encoder_only', action='store_true', help='Export and benchmark encoder only')
     parser.add_argument('--backbone_only', action='store_true', help='Export and benchmark backbone only')
-    parser.add_argument('--resolution', type=int, default=640, help="input resolution")
+    parser.add_argument('--resolution', type=int, default=576, help="input resolution")
     parser.add_argument('--use_cls_token', action='store_true', help='use cls token')
     parser.add_argument('--multi_scale', action='store_true', help='use multi scale')
     parser.add_argument('--expanded_scales', action='store_true', help='use expanded scales')
@@ -858,17 +1045,17 @@ def get_args_parser():
                                help="build tensorrt engine")
     parser_export.add_argument('--dry-run', '--test', '-t', action='store_true', help="just print command")
     parser_export.add_argument('--profile', action='store_true', help='Run nsys profiling during TensorRT export')
-    parser_export.add_argument('--shape', type=int, nargs=2, default=(640, 640), help="input shape (width, height)")
+    parser_export.add_argument('--shape', type=int, nargs=2, default=(576, 576), help="input shape (width, height)")
     return parser
 
 def populate_args(
     # Basic training parameters
     num_classes=2,
-    grad_accum_steps=1,
+    grad_accum_steps=DEFAULT_GRAD_ACCUM_STEPS,
     amp=False,
     lr=1e-4,
     lr_encoder=1.5e-4,
-    batch_size=2,
+    batch_size=DEFAULT_BATCH_SIZE,
     weight_decay=1e-4,
     epochs=12,
     lr_drop=11,
@@ -915,9 +1102,11 @@ def populate_args(
     projector_scale='P4',
     lite_refpoint_refine=False,
     num_select=100,
+    max_detections_per_class=20,
     dec_n_points=4,
     decoder_norm='LN',
     bbox_reparam=False,
+    segmentation_head=False,
     freeze_batch_norm=False,
     
     # Matcher parameters
@@ -929,6 +1118,10 @@ def populate_args(
     cls_loss_coef=2,
     bbox_loss_coef=5,
     giou_loss_coef=2,
+    mask_ce_loss_coef=1.0,
+    mask_dice_loss_coef=1.0,
+    mask_point_sample_ratio=16,
+    mask_downsample_ratio=4,
     focal_alpha=0.25,
     aux_loss=True,
     sum_group_losses=False,
@@ -941,6 +1134,10 @@ def populate_args(
     coco_path=None,
     dataset_dir=None,
     square_resize_div_64=False,
+    cache_images=True,
+    cache_dir=None,
+    preload_shared=False,
+    share_labels=True,
     
     # Output parameters
     output_dir='output',
@@ -953,7 +1150,7 @@ def populate_args(
     use_ema=False,
     ema_decay=0.9997,
     ema_tau=0,
-    num_workers=2,
+    num_workers=DEFAULT_NUM_WORKERS,
     
     # Distributed training parameters
     device='cuda',
@@ -963,11 +1160,13 @@ def populate_args(
     
     # FP16
     fp16_eval=False,
+    cuda_graph=True,
+    inductor_cudagraphs=None,
     
     # Custom args
     encoder_only=False,
     backbone_only=False,
-    resolution=640,
+    resolution=576,
     use_cls_token=False,
     multi_scale=False,
     expanded_scales=False,
@@ -1030,9 +1229,11 @@ def populate_args(
         projector_scale=projector_scale,
         lite_refpoint_refine=lite_refpoint_refine,
         num_select=num_select,
+        max_detections_per_class=max_detections_per_class,
         dec_n_points=dec_n_points,
         decoder_norm=decoder_norm,
         bbox_reparam=bbox_reparam,
+        segmentation_head=segmentation_head,
         freeze_batch_norm=freeze_batch_norm,
         set_cost_class=set_cost_class,
         set_cost_bbox=set_cost_bbox,
@@ -1040,6 +1241,10 @@ def populate_args(
         cls_loss_coef=cls_loss_coef,
         bbox_loss_coef=bbox_loss_coef,
         giou_loss_coef=giou_loss_coef,
+        mask_ce_loss_coef=mask_ce_loss_coef,
+        mask_dice_loss_coef=mask_dice_loss_coef,
+        mask_point_sample_ratio=mask_point_sample_ratio,
+        mask_downsample_ratio=mask_downsample_ratio,
         focal_alpha=focal_alpha,
         aux_loss=aux_loss,
         sum_group_losses=sum_group_losses,
@@ -1050,6 +1255,10 @@ def populate_args(
         coco_path=coco_path,
         dataset_dir=dataset_dir,
         square_resize_div_64=square_resize_div_64,
+        cache_images=cache_images,
+        cache_dir=cache_dir,
+        preload_shared=preload_shared,
+        share_labels=share_labels,
         output_dir=output_dir,
         dont_save_weights=dont_save_weights,
         checkpoint_interval=checkpoint_interval,
@@ -1066,6 +1275,8 @@ def populate_args(
         dist_url=dist_url,
         sync_bn=sync_bn,
         fp16_eval=fp16_eval,
+        cuda_graph=cuda_graph,
+        inductor_cudagraphs=inductor_cudagraphs,
         encoder_only=encoder_only,
         backbone_only=backbone_only,
         resolution=resolution,

@@ -175,8 +175,14 @@ cython_debug/
 
 .idea/
 
+synth*
+
 # model artifacts
 rf-detr*
 output/*
 
 train_test.py
+
+node_modules
+
+yarn.lock

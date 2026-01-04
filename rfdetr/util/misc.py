@@ -19,7 +19,9 @@ Mostly copy-paste from torchvision references.
 import datetime
 import os
 import pickle
+import queue
 import subprocess
+import threading
 import time
 from collections import defaultdict, deque
 from typing import Optional, List
@@ -68,24 +70,34 @@ class SmoothedValue(object):
 
     @property
     def median(self):
+        if not self.deque:
+            return 0.0
         d = torch.tensor(list(self.deque))
         return d.median().item()
 
     @property
     def avg(self):
+        if not self.deque:
+            return 0.0
         d = torch.tensor(list(self.deque), dtype=torch.float32)
         return d.mean().item()
 
     @property
     def global_avg(self):
+        if self.count == 0:
+            return 0.0
         return self.total / self.count
 
     @property
     def max(self):
+        if not self.deque:
+            return 0.0
         return max(self.deque)
 
     @property
     def value(self):
+        if not self.deque:
+            return 0.0
         return self.deque[-1]
 
     def __str__(self):
@@ -167,15 +179,67 @@ def reduce_dict(input_dict, average=True):
     return reduced_dict
 
 
+class _AsyncLogWorker:
+    def __init__(self, enabled: bool, wandb=None):
+        self._enabled = bool(enabled)
+        self._wandb = wandb
+        self._queue = None
+        self._stop = None
+        self._thread = None
+        if not self._enabled:
+            return
+        self._queue = queue.SimpleQueue()
+        self._stop = object()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self):
+        while True:
+            item = self._queue.get()
+            if item is self._stop:
+                break
+            message, log_dict = item
+            if log_dict and self._wandb:
+                try:
+                    self._wandb.log(log_dict)
+                except Exception:
+                    pass
+            if message:
+                print(message)
+
+    def log(self, message=None, log_dict=None):
+        if not self._enabled:
+            if log_dict and self._wandb:
+                try:
+                    self._wandb.log(log_dict)
+                except Exception:
+                    pass
+            if message:
+                print(message)
+            return
+        self._queue.put((message, log_dict))
+
+    def close(self):
+        if not self._enabled or self._thread is None:
+            return
+        self._queue.put(self._stop)
+        self._thread.join(timeout=5)
+
+
 class MetricLogger(object):
-    def __init__(self, delimiter="\t", wandb_logging=False):
+    def __init__(self, delimiter="\t", wandb_logging=False, async_logging=True):
         self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
-        if wandb_logging:
+        if wandb_logging and is_main_process():
             import wandb
             self.wandb = wandb
         else:
             self.wandb = None
+        # Async logging is always enabled for the main process.
+        self._async_logger = _AsyncLogWorker(
+            enabled=is_main_process(),
+            wandb=self.wandb,
+        )
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
@@ -207,6 +271,10 @@ class MetricLogger(object):
     def add_meter(self, name, meter):
         self.meters[name] = meter
 
+    def close(self):
+        if self._async_logger is not None:
+            self._async_logger.close()
+
     def log_every(self, iterable, print_freq, header=None):
         i = 0
         if not header:
@@ -215,7 +283,8 @@ class MetricLogger(object):
         end = time.time()
         iter_time = SmoothedValue(fmt='{avg:.4f}')
         data_time = SmoothedValue(fmt='{avg:.4f}')
-        space_fmt = ':' + str(len(str(len(iterable)))) + 'd'
+        iterable_len = len(iterable)
+        space_fmt = ':' + str(len(str(iterable_len))) + 'd'
         if torch.cuda.is_available():
             log_msg = self.delimiter.join([
                 header,
@@ -240,30 +309,40 @@ class MetricLogger(object):
             data_time.update(time.time() - end)
             yield obj
             iter_time.update(time.time() - end)
-            if i % print_freq == 0 or i == len(iterable) - 1:
-                eta_seconds = iter_time.global_avg * (len(iterable) - i)
+            if i % print_freq == 0 or i == iterable_len - 1:
+                eta_seconds = iter_time.global_avg * (iterable_len - i)
                 eta_string = str(datetime.timedelta(seconds=int(eta_seconds)))
                 if self.wandb:
-                    if is_main_process():
-                        log_dict = {k: v.value for k, v in self.meters.items()}
-                        self.wandb.log(log_dict)
+                    log_dict = {k: v.value for k, v in self.meters.items()}
+                else:
+                    log_dict = None
                 if torch.cuda.is_available():
-                    print(log_msg.format(
-                        i, len(iterable), eta=eta_string,
+                    log_message = log_msg.format(
+                        i, iterable_len, eta=eta_string,
                         meters=str(self),
                         time=str(iter_time), data=str(data_time),
-                        memory=torch.cuda.max_memory_allocated() / MB))
+                        memory=torch.cuda.max_memory_allocated() / MB)
                 else:
-                    print(log_msg.format(
-                        i, len(iterable), eta=eta_string,
+                    log_message = log_msg.format(
+                        i, iterable_len, eta=eta_string,
                         meters=str(self),
-                        time=str(iter_time), data=str(data_time)))
+                        time=str(iter_time), data=str(data_time))
+                if self._async_logger is not None:
+                    self._async_logger.log(log_message, log_dict)
+                else:
+                    if log_dict and self.wandb:
+                        self.wandb.log(log_dict)
+                    print(log_message)
             i += 1
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
-        print('{} Total time: {} ({:.4f} s / it)'.format(
-            header, total_time_str, total_time / len(iterable)))
+        total_message = '{} Total time: {} ({:.4f} s / it)'.format(
+            header, total_time_str, total_time / iterable_len)
+        if self._async_logger is not None:
+            self._async_logger.log(total_message, None)
+        else:
+            print(total_message)
 
 
 def get_sha():
@@ -289,6 +368,109 @@ def get_sha():
 def collate_fn(batch):
     batch = list(zip(*batch))
     batch[0] = nested_tensor_from_tensor_list(batch[0])
+    targets = batch[1]
+    if not targets:
+        batch[1] = {}
+        return tuple(batch)
+    if isinstance(targets, dict):
+        return tuple(batch)
+
+    per_image_keys = {"image_id", "orig_size", "size"}
+    lengths = []
+    for t in targets:
+        if "labels" in t:
+            lengths.append(int(t["labels"].shape[0]))
+        elif "boxes" in t:
+            lengths.append(int(t["boxes"].shape[0]))
+        elif "masks" in t:
+            lengths.append(int(t["masks"].shape[0]))
+        else:
+            lengths.append(0)
+
+    bs = len(targets)
+    max_len = max(max(lengths), 1)
+    lengths_tensor = torch.as_tensor(lengths, dtype=torch.int64)
+
+    padded = {"lengths": lengths_tensor}
+
+    if "boxes" in targets[0]:
+        boxes = [t["boxes"] for t in targets]
+        box_shape = boxes[0].shape[1:]
+        boxes_padded = torch.zeros(
+            (bs, max_len, *box_shape),
+            dtype=boxes[0].dtype,
+            device=boxes[0].device,
+        )
+        for i, b in enumerate(boxes):
+            n = b.shape[0]
+            if n > 0:
+                boxes_padded[i, :n] = b
+        padded["boxes"] = boxes_padded
+
+    if "labels" in targets[0]:
+        labels = [t["labels"] for t in targets]
+        label_shape = labels[0].shape[1:]
+        labels_padded = torch.full(
+            (bs, max_len, *label_shape),
+            -1,
+            dtype=labels[0].dtype,
+            device=labels[0].device,
+        )
+        for i, l in enumerate(labels):
+            n = l.shape[0]
+            if n > 0:
+                labels_padded[i, :n] = l
+        padded["labels"] = labels_padded
+
+    if "area" in targets[0]:
+        areas = [t["area"] for t in targets]
+        area_shape = areas[0].shape[1:]
+        areas_padded = torch.zeros(
+            (bs, max_len, *area_shape),
+            dtype=areas[0].dtype,
+            device=areas[0].device,
+        )
+        for i, a in enumerate(areas):
+            n = a.shape[0]
+            if n > 0:
+                areas_padded[i, :n] = a
+        padded["area"] = areas_padded
+
+    if "iscrowd" in targets[0]:
+        crowds = [t["iscrowd"] for t in targets]
+        crowd_shape = crowds[0].shape[1:]
+        crowds_padded = torch.zeros(
+            (bs, max_len, *crowd_shape),
+            dtype=crowds[0].dtype,
+            device=crowds[0].device,
+        )
+        for i, c in enumerate(crowds):
+            n = c.shape[0]
+            if n > 0:
+                crowds_padded[i, :n] = c
+        padded["iscrowd"] = crowds_padded
+
+    if "masks" in targets[0]:
+        masks = [t["masks"] for t in targets]
+        max_h = max(m.shape[-2] for m in masks)
+        max_w = max(m.shape[-1] for m in masks)
+        masks_padded = torch.zeros(
+            (bs, max_len, max_h, max_w),
+            dtype=masks[0].dtype,
+            device=masks[0].device,
+        )
+        for i, m in enumerate(masks):
+            n = m.shape[0]
+            if n > 0:
+                h, w = m.shape[-2:]
+                masks_padded[i, :n, :h, :w] = m
+        padded["masks"] = masks_padded
+
+    for key in per_image_keys:
+        if key in targets[0]:
+            padded[key] = torch.stack([t[key] for t in targets], dim=0)
+
+    batch[1] = padded
     return tuple(batch)
 
 
@@ -306,16 +488,21 @@ class NestedTensor(object):
         self.tensors = tensors
         self.mask = mask
 
-    def to(self, device):
-        # type: (Device) -> NestedTensor # noqa
-        cast_tensor = self.tensors.to(device)
+    def to(self, device, non_blocking=False):
+        # type: (Device, bool) -> NestedTensor # noqa
+        cast_tensor = self.tensors.to(device, non_blocking=non_blocking)
         mask = self.mask
         if mask is not None:
             assert mask is not None
-            cast_mask = mask.to(device)
+            cast_mask = mask.to(device, non_blocking=non_blocking)
         else:
             cast_mask = None
         return NestedTensor(cast_tensor, cast_mask)
+
+    def pin_memory(self):
+        tensors = self.tensors.pin_memory()
+        mask = self.mask.pin_memory() if self.mask is not None else None
+        return NestedTensor(tensors, mask)
 
     def decompose(self):
         return self.tensors, self.mask
@@ -333,7 +520,10 @@ def nested_tensor_from_tensor_list(tensor_list: List[Tensor]):
             return _onnx_nested_tensor_from_tensor_list(tensor_list)
 
         # TODO make it support different-sized images
-        max_size = _max_by_axis([list(img.shape) for img in tensor_list])
+        sizes = [list(img.shape) for img in tensor_list]
+        max_size = _max_by_axis(sizes)
+        if all(size == max_size for size in sizes):
+            return NestedTensor(torch.stack(tensor_list, dim=0), None)
         # min_size = tuple(min(s) for s in zip(*[img.shape for img in tensor_list]))
         batch_shape = [len(tensor_list)] + max_size
         b, c, h, w = batch_shape

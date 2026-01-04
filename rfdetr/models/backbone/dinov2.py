@@ -10,10 +10,10 @@ from transformers import AutoBackbone
 import torch.nn.functional as F
 import types
 import math
-import json
 import os
 
 from .dinov2_with_windowed_attn import WindowedDinov2WithRegistersConfig, WindowedDinov2WithRegistersBackbone
+from rfdetr.util.json_utils import load_json
 
 
 size_to_width = {
@@ -40,14 +40,13 @@ def get_config(size, use_registers):
     current_dir = os.path.dirname(os.path.abspath(__file__))
     configs_dir = os.path.join(current_dir, "dinov2_configs")
     config_path = os.path.join(configs_dir, config_dict[size])
-    with open(config_path, "r") as f:
-        dino_config = json.load(f)
+    dino_config = load_json(config_path)
     return dino_config
 
 
 class DinoV2(nn.Module):
     def __init__(self,
-            shape=(640, 640),
+            shape=(576, 576),
             out_feature_indexes=[2, 4, 5, 9],
             size="base",
             use_registers=True,
@@ -191,7 +190,7 @@ class DinoV2(nn.Module):
 if __name__ == "__main__":
     model = DinoV2()
     model.export()
-    x = torch.randn(1, 3, 640, 640)
+    x = torch.randn(1, 3, 576, 576)
     print(model(x))
     for j in model(x):
         print(j.shape)

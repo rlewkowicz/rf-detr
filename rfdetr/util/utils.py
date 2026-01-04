@@ -1,8 +1,9 @@
 from copy import deepcopy
 import torch
-import json
 from collections import OrderedDict
 import math
+
+from rfdetr.util.json_utils import dumps_json
 
 
 class ModelEma(torch.nn.Module):
@@ -112,7 +113,7 @@ class BestMetricHolder():
         return res
 
     def __repr__(self) -> str:
-        return json.dumps(self.summary(), indent=2)
+        return dumps_json(self.summary(), indent=True)
 
     def __str__(self) -> str:
         return self.__repr__()

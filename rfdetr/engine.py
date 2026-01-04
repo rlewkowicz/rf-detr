@@ -20,14 +20,11 @@ Train and eval functions used in main.py
 import math
 import sys
 from typing import Iterable
-import random
-
 import torch
-import torch.nn.functional as F
 
 import rfdetr.util.misc as utils
 from rfdetr.datasets.coco_eval import CocoEvaluator
-from rfdetr.datasets.coco import compute_multi_scale_scales
+from rfdetr.util.prefetcher import maybe_cuda_prefetcher, CUDAPrefetcher
 
 try:
     from torch.amp import autocast, GradScaler
@@ -36,7 +33,6 @@ except ImportError:
     from torch.cuda.amp import autocast, GradScaler
     DEPRECATED_AMP = True
 from typing import DefaultDict, List, Callable
-from rfdetr.util.misc import NestedTensor
 import numpy as np
 
 def get_autocast_args(args):
@@ -69,11 +65,23 @@ def train_one_epoch(
         "class_error", utils.SmoothedValue(window_size=1, fmt="{value:.2f}")
     )
     header = "Epoch: [{}]".format(epoch)
-    print_freq = 10
+    print_freq = 20
     start_steps = epoch * num_training_steps_per_epoch
 
+    prefetch_enabled = getattr(args, "cuda_prefetcher", True)
+    data_loader = maybe_cuda_prefetcher(
+        data_loader,
+        device=device,
+        enabled=prefetch_enabled,
+        prefetch_batches=None,
+        warmup_batches=2,
+        max_prefetch_mem_frac=0.6,
+    )
+    use_prefetcher = isinstance(data_loader, CUDAPrefetcher)
+
+    effective_batch_size = batch_size * args.grad_accum_steps
     print("Grad accum steps: ", args.grad_accum_steps)
-    print("Total batch size: ", batch_size * utils.get_world_size())
+    print("Total batch size: ", effective_batch_size * utils.get_world_size())
 
     # Add gradient scaler for AMP
     if DEPRECATED_AMP:
@@ -81,16 +89,83 @@ def train_one_epoch(
     else:
         scaler = GradScaler('cuda', enabled=args.amp)
 
+    if args.multi_scale or args.do_random_resize_via_padding:
+        raise ValueError("Resize/augmentation disabled; images must be fixed size.")
+
     optimizer.zero_grad()
-    assert batch_size % args.grad_accum_steps == 0
-    sub_batch_size = batch_size // args.grad_accum_steps
     print("LENGTH OF DATA LOADER:", len(data_loader))
+    update_step = start_steps
+    start_micro_steps = start_steps * args.grad_accum_steps
+    loss_dict_accum = None
+    accum_steps = 0
+    max_micro_steps = (
+        num_training_steps_per_epoch * args.grad_accum_steps
+        if num_training_steps_per_epoch is not None
+        else None
+    )
+
+    enable_cuda_graph = getattr(args, "cuda_graph", True) and device.type == "cuda"
+    cuda_graph = None
+    static_samples = None
+    static_targets = None
+    static_outputs = None
+    graph_signature = None
+    graph_primed = False
+    cudagraph_mark_step_begin = None
+    if args is not None and getattr(args, "inductor_cudagraphs", False):
+        cudagraph_mark_step_begin = getattr(
+            getattr(torch, "compiler", None),
+            "cudagraph_mark_step_begin",
+            None,
+        )
+
+    def _graph_signature(samples, targets):
+        if hasattr(samples, "tensors"):
+            sample_shape = tuple(samples.tensors.shape)
+            mask_shape = tuple(samples.mask.shape) if samples.mask is not None else None
+            sample_dtype = samples.tensors.dtype
+        else:
+            sample_shape = tuple(samples.shape)
+            mask_shape = None
+            sample_dtype = samples.dtype
+        target_sig = tuple(
+            (k, tuple(targets[k].shape), targets[k].dtype)
+            for k in sorted(targets.keys())
+        )
+        return (sample_shape, mask_shape, sample_dtype, target_sig)
+
+    def _clone_samples(samples):
+        if hasattr(samples, "tensors"):
+            mask = samples.mask
+            return utils.NestedTensor(
+                samples.tensors.clone(),
+                mask.clone() if mask is not None else None,
+            )
+        return samples.clone()
+
+    def _copy_samples(dst, src):
+        if hasattr(dst, "tensors"):
+            dst.tensors.copy_(src.tensors)
+            if dst.mask is not None and src.mask is not None:
+                dst.mask.copy_(src.mask)
+            return
+        dst.copy_(src)
+
+    def _clone_targets(targets):
+        return {k: v.clone() for k, v in targets.items()}
+
+    def _copy_targets(dst, src):
+        for k, v in src.items():
+            dst[k].copy_(v)
+
     for data_iter_step, (samples, targets) in enumerate(
         metric_logger.log_every(data_loader, print_freq, header)
     ):
-        it = start_steps + data_iter_step
+        if max_micro_steps is not None and data_iter_step >= max_micro_steps:
+            break
+        micro_step = start_micro_steps + data_iter_step
         callback_dict = {
-            "step": it,
+            "step": micro_step,
             "model": model,
             "epoch": epoch,
         }
@@ -99,47 +174,79 @@ def train_one_epoch(
         if "dp" in schedules:
             if args.distributed:
                 model.module.update_drop_path(
-                    schedules["dp"][it], vit_encoder_num_layers
+                    schedules["dp"][update_step], vit_encoder_num_layers
                 )
             else:
-                model.update_drop_path(schedules["dp"][it], vit_encoder_num_layers)
+                model.update_drop_path(schedules["dp"][update_step], vit_encoder_num_layers)
         if "do" in schedules:
             if args.distributed:
-                model.module.update_dropout(schedules["do"][it])
+                model.module.update_dropout(schedules["do"][update_step])
             else:
-                model.update_dropout(schedules["do"][it])
+                model.update_dropout(schedules["do"][update_step])
 
-        if args.multi_scale and not args.do_random_resize_via_padding:
-            scales = compute_multi_scale_scales(args.resolution, args.expanded_scales, args.patch_size, args.num_windows)
-            random.seed(it)
-            scale = random.choice(scales)
-            with torch.inference_mode():
-                samples.tensors = F.interpolate(samples.tensors, size=scale, mode='bilinear', align_corners=False)
-                samples.mask = F.interpolate(samples.mask.unsqueeze(1).float(), size=scale, mode='nearest').squeeze(1).bool()
+        if not use_prefetcher:
+            samples = samples.to(device)
+            targets = {k: v.to(device) for k, v in targets.items()}
 
-        for i in range(args.grad_accum_steps):
-            start_idx = i * sub_batch_size
-            final_idx = start_idx + sub_batch_size
-            new_samples_tensors = samples.tensors[start_idx:final_idx]
-            new_samples = NestedTensor(new_samples_tensors, samples.mask[start_idx:final_idx])
-            new_samples = new_samples.to(device)
-            new_targets = [{k: v.to(device) for k, v in t.items()} for t in targets[start_idx:final_idx]]
+        if cudagraph_mark_step_begin is not None:
+            cudagraph_mark_step_begin()
 
-            with autocast(**get_autocast_args(args)):
-                outputs = model(new_samples, new_targets)
-                loss_dict = criterion(outputs, new_targets)
-                weight_dict = criterion.weight_dict
-                losses = sum(
-                    (1 / args.grad_accum_steps) * loss_dict[k] * weight_dict[k]
-                    for k in loss_dict.keys()
-                    if k in weight_dict
-                )
+        with autocast(**get_autocast_args(args)):
+            use_cuda_graph = False
+            # CUDA Graph: capture forward on first compatible shape, replay on static buffers.
+            if enable_cuda_graph:
+                current_signature = _graph_signature(samples, targets)
+                if current_signature != graph_signature:
+                    graph_signature = current_signature
+                    cuda_graph = None
+                    static_samples = None
+                    static_targets = None
+                    static_outputs = None
+                    graph_primed = False
 
+                if not graph_primed:
+                    # Prime compilation and allocations outside capture.
+                    outputs = model(samples, targets)
+                    graph_primed = True
+                else:
+                    if cuda_graph is None:
+                        static_samples = _clone_samples(samples)
+                        static_targets = _clone_targets(targets)
+                        torch.cuda.synchronize()
+                        cuda_graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(cuda_graph):
+                            static_outputs = model(static_samples, static_targets)
+                    else:
+                        _copy_samples(static_samples, samples)
+                        _copy_targets(static_targets, targets)
+                        cuda_graph.replay()
+                    outputs = static_outputs
+                    use_cuda_graph = True
+            else:
+                outputs = model(samples, targets)
+            loss_dict = criterion(outputs, targets)
+            weight_dict = criterion.weight_dict
+            losses = sum(
+                loss_dict[k] * weight_dict[k]
+                for k in loss_dict.keys()
+                if k in weight_dict
+            ) / args.grad_accum_steps
 
-            scaler.scale(losses).backward()
+        scaler.scale(losses).backward(retain_graph=use_cuda_graph)
+        if loss_dict_accum is None:
+            loss_dict_accum = {k: v.detach() for k, v in loss_dict.items()}
+        else:
+            for k, v in loss_dict.items():
+                loss_dict_accum[k] += v.detach()
+
+        accum_steps += 1
+        if accum_steps < args.grad_accum_steps:
+            continue
 
         # reduce losses over all GPUs for logging purposes
-        loss_dict_reduced = utils.reduce_dict(loss_dict)
+        loss_dict_reduced = utils.reduce_dict(
+            {k: v / accum_steps for k, v in loss_dict_accum.items()}
+        )
         loss_dict_reduced_unscaled = {
             f"{k}_unscaled": v for k, v in loss_dict_reduced.items()
         }
@@ -172,8 +279,15 @@ def train_one_epoch(
         )
         metric_logger.update(class_error=loss_dict_reduced["class_error"])
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
+        update_step += 1
+        accum_steps = 0
+        loss_dict_accum = None
+
+    if accum_steps:
+        optimizer.zero_grad()
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
+    metric_logger.close()
     print("Averaged stats:", metric_logger)
     return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
 
@@ -260,13 +374,21 @@ def evaluate(model, criterion, postprocess, data_loader, base_ds, device, args=N
         "class_error", utils.SmoothedValue(window_size=1, fmt="{value:.2f}")
     )
     header = "Test:"
+    print_freq = 20
 
     iou_types = ("bbox",) if not args.segmentation_head else ("bbox", "segm")
     coco_evaluator = CocoEvaluator(base_ds, iou_types)
 
-    for samples, targets in metric_logger.log_every(data_loader, 10, header):
-        samples = samples.to(device)
-        targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+    prefetch_enabled = True if args is None else getattr(args, "cuda_prefetcher", True)
+    data_loader = maybe_cuda_prefetcher(
+        data_loader, device=device, enabled=prefetch_enabled, prefetch_batches=2
+    )
+    use_prefetcher = isinstance(data_loader, CUDAPrefetcher)
+
+    for samples, targets in metric_logger.log_every(data_loader, print_freq, header):
+        if not use_prefetcher:
+            samples = samples.to(device)
+            targets = {k: v.to(device) for k, v in targets.items()}
 
         if args.fp16_eval:
             samples.tensors = samples.tensors.half()
@@ -309,17 +431,18 @@ def evaluate(model, criterion, postprocess, data_loader, base_ds, device, args=N
         )
         metric_logger.update(class_error=loss_dict_reduced["class_error"])
 
-        orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
+        orig_target_sizes = targets["orig_size"]
         results_all = postprocess(outputs, orig_target_sizes)
-        res = {
-            target["image_id"].item(): output
-            for target, output in zip(targets, results_all)
-        }
+        image_ids = targets["image_id"]
+        if image_ids.ndim > 1:
+            image_ids = image_ids.squeeze(-1)
+        res = {image_id.item(): output for image_id, output in zip(image_ids, results_all)}
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
+    metric_logger.close()
     print("Averaged stats:", metric_logger)
     if coco_evaluator is not None:
         coco_evaluator.synchronize_between_processes()

@@ -11,7 +11,11 @@
 from pathlib import Path
 
 from .coco import (
-    CocoDetection, make_coco_transforms, make_coco_transforms_square_div_64
+    CocoDetection,
+    make_coco_transforms,
+    make_coco_transforms_square_div_64,
+    _cache_args,
+    maybe_shared_labels,
 )
 
 from PIL import Image
@@ -20,6 +24,7 @@ Image.MAX_IMAGE_PIXELS = None
 
 def build_o365_raw(image_set, args, resolution):
     root = Path(args.coco_path)
+    cache_images, cache_dir = _cache_args(root, args)
     PATHS = {
         "train": (root, root / 'zhiyuan_objv2_train_val_wo_5k.json'),
         "val": (root, root / 'zhiyuan_objv2_minival5k.json'),
@@ -36,10 +41,39 @@ def build_o365_raw(image_set, args, resolution):
     except:
         square_resize_div_64 = False
 
+    include_masks = bool(getattr(args, "segmentation_head", False))
+    shared_labels = maybe_shared_labels(ann_file, include_masks, args)
+
     if square_resize_div_64:
-        dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms_square_div_64(image_set, resolution, multi_scale=args.multi_scale, expanded_scales=args.expanded_scales))
+        dataset = CocoDetection(
+            img_folder,
+            ann_file,
+            transforms=make_coco_transforms_square_div_64(
+                image_set,
+                resolution,
+                multi_scale=args.multi_scale,
+                expanded_scales=args.expanded_scales,
+            ),
+            include_masks=include_masks,
+            cache_images=cache_images,
+            cache_dir=cache_dir,
+            shared_labels=shared_labels,
+        )
     else:
-        dataset = CocoDetection(img_folder, ann_file, transforms=make_coco_transforms(image_set, resolution, multi_scale=args.multi_scale, expanded_scales=args.expanded_scales))
+        dataset = CocoDetection(
+            img_folder,
+            ann_file,
+            transforms=make_coco_transforms(
+                image_set,
+                resolution,
+                multi_scale=args.multi_scale,
+                expanded_scales=args.expanded_scales,
+            ),
+            include_masks=include_masks,
+            cache_images=cache_images,
+            cache_dir=cache_dir,
+            shared_labels=shared_labels,
+        )
     return dataset
 
 
